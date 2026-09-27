@@ -6,7 +6,8 @@
     "build:questions": "node build-questions.mjs",
     "test": "node --test rules.test.mjs",
     "e2e": "node e2e.mjs",
-    "serve": "python3 -m http.server 8765 --directory ../site"
+    "serve": "python3 -m http.server 8765 --directory ../site",
+    "resilience": "node resilience.mjs"
   },
   "license": "MIT",
   "type": "module",

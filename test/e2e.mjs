@@ -125,6 +125,13 @@ try {
     assert.deepEqual(Object.keys(ps.q).sort(), ['text', 'u']);
 
     const [mh, m1, m2] = plan[r - 1];
+    if (r === 1) {
+      // Phone keypads have no letters: typing 1.3 and tapping "million" must work.
+      await p1.page.fill('#guess', '1.3');
+      await p1.page.click('.mult button[data-word="million"]');
+      assert.equal(await p1.page.inputValue('#guess'), '1.3 million');
+      assert.match(await p1.page.textContent('#guess-preview'), /1,300,000/);
+    }
     await guess(p1, answer * m1);
 
     if (r === 1) {

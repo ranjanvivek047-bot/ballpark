@@ -15,11 +15,15 @@ const MULTIPLIERS = {
 
 /**
  * Turn what a player typed into a number.
- * Accepts "1500", "1,500", "1.3 million", "25k", "2.5bn".
+ * Accepts "1500", "1,500", "1.3 million", "25k", "2.5bn", and a decimal comma
+ * as typed on phones set to many regions ("2,54" is 2.54, "1,500" is 1500).
  * Returns null for empty input and NaN for anything that is not a number.
  */
 export function parseGuess(raw) {
-  const s = String(raw ?? '').trim().toLowerCase().replace(/,/g, '').replace(/\s+/g, ' ');
+  let s = String(raw ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const groupedThousands = /^-?\d{1,3}(,\d{3})+(\D|$)/.test(s);
+  if (!s.includes('.') && /^-?\d+,\d+/.test(s) && !groupedThousands) s = s.replace(',', '.');
+  s = s.replace(/,/g, '');
   if (!s) return null;
   const m = s.match(/^(-?(?:\d+\.?\d*|\.\d+))\s*([a-z]+)?$/);
   if (!m) return NaN;
@@ -67,7 +71,7 @@ export function pickWinners(players) {
 }
 
 export function cleanName(raw) {
-  return String(raw ?? '')
+  return String(typeof raw === 'string' ? raw : '')
     .replace(/\s+/g, ' ')
     .replace(/[\u0000-\u001f\u007f]/g, '')
     .trim()

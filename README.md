@@ -29,6 +29,7 @@ Tied guesses share the higher place. No guess, no points. After the last round (
 - The host's browser runs the game: it receives each player's actions, applies the rules in `site/rules.js`, and publishes one shared game state that every screen renders.
 - Guesses and answers are never sent to other players until the reveal.
 - Refreshing the page keeps your seat. That works for the host too.
+- If the host's phone sleeps or drops offline, the round waits for everyone's guesses instead of ending early.
 - 60 questions, each checked against at least one reputable source.
 
 ## Run it locally
@@ -47,6 +48,7 @@ Open two windows (one normal, one private) to play against yourself.
 cd test
 npm test             # scoring rules
 npm run e2e          # full game across several real browser sessions (needs Google Chrome)
+npm run resilience   # host page freezing mid-round, a player leaving mid-round, decimal commas
 ```
 
 The end-to-end test plays a 5-round game with three players and checks every scoring rule. It also covers joining by code and by invite link, hidden guesses, the timer, a tied round, refreshing mid-game for both a player and the host, the 8-player limit, leaving, and closing the room.

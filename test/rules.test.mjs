@@ -20,6 +20,24 @@ test('parseGuess reads plain and shorthand numbers', () => {
   assert.ok(Number.isNaN(parseGuess('8849 meters')));
 });
 
+test('parseGuess understands a decimal comma but keeps grouped thousands', () => {
+  assert.equal(parseGuess('2,54'), 2.54);
+  assert.equal(parseGuess('98,6'), 98.6);
+  assert.equal(parseGuess('13,8'), 13.8);
+  assert.equal(parseGuess('-2,5'), -2.5);
+  assert.equal(parseGuess('1,3 million'), 1300000);
+  assert.equal(parseGuess('12,5k'), 12500);
+  assert.equal(parseGuess('1,500'), 1500);
+  assert.equal(parseGuess('1,300,000'), 1300000);
+  assert.equal(parseGuess('1,500.5'), 1500.5);
+});
+
+test('cleanName ignores non-string input', () => {
+  assert.equal(cleanName({ toString() { throw new Error('boom'); } }), '');
+  assert.equal(cleanName(12345), '');
+  assert.equal(cleanName(null), '');
+});
+
 test('closest scores 3, second scores 1 with 3+ players, bullseye adds 2', () => {
   const rows = scoreRound(100, { a: 95, b: 80, c: 300 }, 3);
   const by = Object.fromEntries(rows.map((r) => [r.id, r]));
