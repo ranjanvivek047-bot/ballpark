@@ -1,0 +1,9 @@
+node_modules/
+test/shots/
+test/probe.mjs
+test/factcheck.json
+test/questions.draft.json
+test/questions.final.json
+.DS_Store
+test/capture.mjs
+submission/

@@ -1,0 +1,18 @@
+{
+  "name": "ballpark-tests",
+  "version": "1.0.0",
+  "description": "Tests and build scripts for Ballpark",
+  "scripts": {
+    "build:questions": "node build-questions.mjs",
+    "test": "node --test rules.test.mjs",
+    "e2e": "node e2e.mjs",
+    "serve": "python3 -m http.server 8765 --directory ../site"
+  },
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "mqtt": "^5.16.0",
+    "playwright": "^1.63.0"
+  },
+  "private": true
+}
