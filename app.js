@@ -23,6 +23,9 @@ const HEARTBEAT_MS = 3000;    // host re-publishes state at least this often
 const RESEND_MS = 1500;       // players re-send unconfirmed actions this often
 const PING_MS = 5000;
 const HOST_SILENT_MS = 12000; // players warn after this long without hearing the host
+const GRACE_MS = 1000;        // guesses locked in on time may still be in transit at the deadline
+const STALE_ROOM_MS = 10 * 60 * 1000; // a stored room this old has no host any more
+const MAX_ACT_BYTES = 1024;   // real actions are under 200 bytes
 const CODE_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; // no I or O
 const COLORS = ['#ffc93c', '#5ec8f2', '#ff7ab6', '#7be495', '#ff9a52', '#b99bff', '#ff6b5e', '#4fd1c5'];
 const ROUND_CHOICES = [5, 7, 10];
@@ -84,8 +87,11 @@ let H = null;        // host only: the full game, including secrets and answers
 let skew = 0;        // host clock minus our clock
 let lastLive = 0;    // when we last heard a live state message
 let myName = '';
-let myGuess = null;  // { round, value }
+let myGuess = null;  // { round, dl, value } - dl is that round's deadline, unique per question
 let shownRound = null;
+let curScreen = null;
+let lastTickAt = 0;  // host: when hostTick last ran
+let deafUntil = 0;   // host: hold timers until players have had a chance to re-send
 let lastKey = '';
 let loops = [];
 let lastPing = 0;
@@ -141,10 +147,17 @@ function attach(client, broker, code) {
 
 function onMessage(topic, payload, packet) {
   if (!net || !payload || !payload.length) return;
+  const isAct = topic === T(net.code, 'act');
+  if (isAct && payload.length > MAX_ACT_BYTES) return;
   let msg;
   try { msg = JSON.parse(payload.toString()); } catch { return; }
-  if (role === 'player' && topic === T(net.code, 'state')) applyState(msg, packet.retain);
-  else if (role === 'host' && topic === T(net.code, 'act')) hostHandle(msg);
+  // A bad message must never break the message pump.
+  try {
+    if (role === 'player' && topic === T(net.code, 'state')) applyState(msg, packet.retain);
+    else if (role === 'host' && isAct) hostHandle(msg);
+  } catch (err) {
+    console.warn('Ignored a bad message', err);
+  }
 }
 
 /** Checks whether a room code already has a game on this relay. */
@@ -203,10 +216,11 @@ function probeRelays(indexes, code, ms) {
           if (t !== topic || !p || !p.length) return;
           let s;
           try { s = JSON.parse(p.toString()); } catch { return; }
-          if (!s || s.code !== code) return;
+          if (!s || s.code !== code || typeof s.now !== 'number') return;
+          if (packet.retain && Date.now() - s.now > STALE_ROOM_MS) return; // host is long gone
           const hit = { client, idx, state: s, live: !packet.retain };
           if (hit.live) finish(hit);
-          else if (!best || idx < best.idx) best = hit;
+          else if (!best || s.now > best.state.now) best = hit;
         };
         open.push({ client, onMsg });
         client.on('message', onMsg);
@@ -267,7 +281,10 @@ const everyoneLocked = () => {
 };
 
 function hostHandle(a) {
-  if (!H || !a || typeof a !== 'object' || typeof a.pid !== 'string' || typeof a.sec !== 'string') return;
+  if (!H || !a || typeof a !== 'object') return;
+  // Ids and secrets are made by rid(10) and rid(16). Anything else is not one of ours.
+  if (typeof a.pid !== 'string' || !/^[0-9a-z]{10}$/.test(a.pid)) return;
+  if (typeof a.sec !== 'string' || !/^[0-9a-z]{16}$/.test(a.sec)) return;
   const now = Date.now();
   const p = H.players.find((x) => x.id === a.pid);
 
@@ -277,15 +294,18 @@ function hostHandle(a) {
     if (p) {
       if (p.secret !== a.sec) return;
       p.lastSeen = now;
-      p.left = false;
-      if (p.away) { p.away = false; changed(); }
+      if (p.away || p.left) { p.away = false; p.left = false; changed(); }
       return;
     }
-    if (H.players.length >= MAX_PLAYERS) {
-      H.rejected[a.pid] = now;
-      changed();
+    const seated = H.players.filter((x) => !x.left);
+    if (seated.length >= MAX_PLAYERS) {
+      if (!Object.hasOwn(H.rejected, a.pid) && Object.keys(H.rejected).length < 16) {
+        H.rejected[a.pid] = now;
+        changed();
+      }
       return;
     }
+    if (H.players.length >= MAX_PLAYERS) H.players = seated; // free the seats of players who left
     H.players.push({
       id: a.pid, secret: a.sec, name: uniqueName(name, a.pid), color: nextColor(),
       score: 0, lastSeen: now, away: false, left: false,
@@ -299,17 +319,16 @@ function hostHandle(a) {
   if (a.t !== 'leave' && (p.away || p.left)) { p.away = false; p.left = false; changed(); }
 
   if (a.t === 'guess') {
-    if (H.phase !== 'question' || a.round !== H.round || p.id in H.guesses) return;
-    if (now > H.deadline + 1000) return; // a little grace for network delay
-    const v = Number(a.value);
-    if (!Number.isFinite(v) || Math.abs(v) > 1e15) return;
-    H.guesses[p.id] = v;
+    if (H.phase !== 'question' || a.round !== H.round || Object.hasOwn(H.guesses, p.id)) return;
+    if (now > Math.max(H.deadline + GRACE_MS, deafUntil)) return;
+    if (typeof a.value !== 'number' || !Number.isFinite(a.value) || Math.abs(a.value) > 1e15) return;
+    H.guesses[p.id] = a.value;
     changed();
     if (everyoneLocked()) doReveal();
   } else if (a.t === 'leave') {
     if (p.id === H.hostId) return;
     if (H.phase === 'lobby') H.players = H.players.filter((x) => x !== p);
-    else { p.away = true; p.left = true; }
+    else { p.away = true; p.left = true; delete H.guesses[p.id]; }
     changed();
     if (H.phase === 'question' && everyoneLocked()) doReveal();
   }
@@ -318,6 +337,16 @@ function hostHandle(a) {
 function hostTick() {
   if (!H || role !== 'host') return;
   const now = Date.now();
+  // If this page was asleep, offline or just reloaded, players' pings and guesses
+  // could not reach us. Give them time to re-send before judging anyone away
+  // or ending the round.
+  if (now - lastTickAt > 2000 || !net?.client?.connected) deafUntil = now + 2 * RESEND_MS + 1000;
+  lastTickAt = now;
+  if (now < deafUntil) {
+    for (const p of H.players) p.lastSeen = Math.max(p.lastSeen, now);
+    if (now - lastPublish >= HEARTBEAT_MS) publishState();
+    return;
+  }
   let dirty = false;
   for (const p of H.players) {
     if (p.id === H.hostId) { p.lastSeen = now; continue; }
@@ -326,7 +355,7 @@ function hostTick() {
   for (const [pid, ts] of Object.entries(H.rejected)) {
     if (now - ts > 30000) { delete H.rejected[pid]; dirty = true; }
   }
-  if (H.phase === 'question' && (now >= H.deadline || everyoneLocked())) { doReveal(); return; }
+  if (H.phase === 'question' && (now >= H.deadline + GRACE_MS || everyoneLocked())) { doReveal(); return; }
   if (H.phase === 'reveal' && now >= H.revealEnds) { advance(); return; }
   if (dirty) changed();
   else if (now - lastPublish >= HEARTBEAT_MS) publishState();
@@ -363,9 +392,13 @@ function nextRound() {
 function doReveal() {
   if (H.phase !== 'question') return;
   const q = QUESTIONS[H.qi];
-  const inGame = activePlayers().length;
   const guesses = {};
-  for (const [id, g] of Object.entries(H.guesses)) if (H.players.some((p) => p.id === id)) guesses[id] = g;
+  for (const [id, g] of Object.entries(H.guesses)) {
+    if (H.players.some((p) => p.id === id && !p.left)) guesses[id] = g;
+  }
+  // Count everyone still seated who is here or guessed, so a player who locked in
+  // and then went quiet still counts towards the 3-player second-place rule.
+  const inGame = H.players.filter((p) => !p.left && (!p.away || Object.hasOwn(guesses, p.id))).length;
   const rows = scoreRound(q.a, guesses, inGame);
   for (const r of rows) {
     const p = H.players.find((x) => x.id === r.id);
@@ -475,18 +508,19 @@ async function createRoom(name) {
 }
 
 async function resumeHost(saved) {
-  showBusy('Reconnecting to your room…');
-  let client;
-  try {
-    client = await connectBroker(saved.broker, 8000);
-  } catch {
-    hideBusy();
-    session.del('host');
-    session.del('room');
-    showHome();
-    showError('Lost the connection to your room. Please create a new one.');
-    return;
+  // Keep trying until it works or the host presses Cancel (which clears the saved game).
+  showBusy('Reconnecting to your room…', true);
+  const stillWanted = () => session.get('host')?.code === saved.code;
+  let client = null;
+  while (!client) {
+    try {
+      client = await connectBroker(saved.broker, 8000);
+    } catch {
+      if (!stillWanted()) return;
+      showBusy("Still reconnecting to your room… Check your internet connection.", true);
+    }
   }
+  if (!stillWanted()) { client.end(true); return; }
   H = saved;
   role = 'host';
   myName = H.players.find((p) => p.id === H.hostId)?.name || '';
@@ -502,8 +536,8 @@ function closeRoom() {
   if (H && client) {
     H.phase = 'closed';
     const s = publicState();
-    client.publish(T(H.code, 'state'), JSON.stringify(s), { qos: 1, retain: false });
-    client.publish(T(H.code, 'state'), '', { qos: 1, retain: true }); // remove the stored room
+    // Stored, so players who were offline find out when they reconnect.
+    client.publish(T(H.code, 'state'), JSON.stringify(s), { qos: 1, retain: true });
   }
   leaveLocal({ keepClient: true });
   setTimeout(() => { try { client?.end(false); } catch { /* already closed */ } }, 1200);
@@ -529,13 +563,22 @@ async function joinRoom(code, name, hint, opts = {}) {
     showError(found ? `Room ${code} has closed.` : `No game found with code ${code}. Check the code with your host.`);
     return;
   }
+  // Reuse this browser's seat in this room, so opening the invite link again
+  // (or in a new tab) doesn't create a second player.
+  let cur = session.get('me');
+  if (cur && cur.id === found.state.host && !session.get('host')) { session.del('me'); cur = null; } // copied from the host's tab
+  const kept = local.get(`me:${code}`);
+  const curIsSeated = !!cur && found.state.players.some((p) => p.id === cur.id);
+  if (kept?.id && kept?.secret && kept.id !== found.state.host && !curIsSeated) session.set('me', kept);
+  local.set(`me:${code}`, me());
+
   role = 'player';
   myName = name;
   attach(found.client, found.idx, code);
   found.client.subscribe(T(code, 'state'), { qos: 0 });
   enterRoom(code, found.idx, 'player', name);
   const saved = session.get('guess');
-  if (saved && saved.code === code) myGuess = { round: saved.round, value: saved.value };
+  if (saved && saved.code === code) myGuess = { round: saved.round, dl: saved.dl, value: saved.value };
   applyState(found.state, !found.live);
   send('join', { name });
 }
@@ -547,7 +590,10 @@ function playerTick() {
   const mine = ST.players.find((p) => p.id === m.id);
   if (!mine) {
     if (!(ST.rejected && ST.rejected[m.id])) send('join', { name: myName });
-  } else if (myGuess && ST.phase === 'question' && ST.round === myGuess.round && !mine.locked) {
+    if (now - lastLive > HOST_SILENT_MS) {
+      showBusy(`Room ${ST.code} isn't answering. The host may have left, or their phone may be asleep.`, true);
+    }
+  } else if (ST.phase === 'question' && sameQuestion(myGuess) && !mine.locked) {
     send('guess', { round: myGuess.round, value: myGuess.value });
   }
   if (now - lastPing >= PING_MS) { lastPing = now; send('ping'); }
@@ -579,6 +625,7 @@ function leaveLocal({ keepClient = false } = {}) {
   net = null;
   if (client && !keepClient) { try { client.end(false); } catch { /* already closed */ } }
   role = null; ST = null; H = null; myGuess = null; shownRound = null; lastKey = '';
+  lastTickAt = 0; deafUntil = 0;
   session.del('room');
   session.del('host');
   session.del('guess');
@@ -602,18 +649,26 @@ function endSession(title, body) {
 
 function applyState(s, retained) {
   if (!s || typeof s !== 'object' || !net || s.code !== net.code) return;
+  if (!Array.isArray(s.players) || typeof s.seq !== 'number' || typeof s.phase !== 'string'
+    || typeof s.host !== 'string' || typeof s.now !== 'number') return;
+  if (ST && s.host === ST.host && s.seq < ST.seq) return;
   if (!retained) { skew = s.now - Date.now(); lastLive = Date.now(); }
-  if (ST && s.host === ST.host && typeof s.seq === 'number' && s.seq < ST.seq) return;
   ST = s;
   render();
 }
 
 function show(id) {
   for (const s of $$('.screen')) s.hidden = s.id !== id;
+  if (id === curScreen) return;
+  curScreen = id;
+  window.scrollTo(0, 0);
+  $(`#${id} [data-focus]`)?.focus({ preventScroll: true });
 }
 
 const findPlayer = (id) => ST?.players.find((p) => p.id === id);
 const remainingMs = () => (ST ? ST.deadline - (Date.now() + skew) : 0);
+// A saved guess belongs to one specific question: same round and same deadline.
+const sameQuestion = (g) => !!g && !!ST && g.round === ST.round && g.dl === ST.deadline;
 
 function avatar(p) {
   return `<span class="avatar" style="background:${safeColor(p?.color)}">${initial(p?.name)}</span>`;
@@ -690,13 +745,13 @@ function renderQuestion(mine, isHost) {
   $('#q-text').textContent = ST.q?.text || '';
   $('#q-unit').textContent = ST.q?.u || '';
 
-  if (shownRound !== ST.round) {
-    shownRound = ST.round;
+  if (shownRound !== ST.deadline) {
+    shownRound = ST.deadline;
     $('#guess').value = '';
     setPreview('');
-    if (myGuess && myGuess.round !== ST.round) myGuess = null;
+    if (!sameQuestion(myGuess)) myGuess = null;
   }
-  const mineLocal = myGuess && myGuess.round === ST.round;
+  const mineLocal = sameQuestion(myGuess);
   const locked = !!(mine && mine.locked) || mineLocal;
   const timeUp = remainingMs() <= 0;
   $('#guess-form').hidden = locked || timeUp || !mine;
@@ -731,7 +786,7 @@ function renderReveal(m, isHost) {
     const off = r.d === 0 ? 'spot on!' : `off by ${esc(fmt(r.d))}`;
     return `
       <li class="${r.place === 1 ? 'first' : ''}">
-        <span class="place">${ordinal(r.place)}</span>
+        <span class="place">${esc(ordinal(Number(r.place) || 0))}</span>
         ${avatar(p)}
         <span class="who"><b>${esc(p.name)}${r.id === m.id ? ' (you)' : ''}</b><span>guessed ${esc(withUnit(r.g, R.u))} · ${off}${r.bull ? ' · bullseye' : ''}</span></span>
         <span class="gain">${gains.join('') || '<span class="zero">0</span>'}</span>
@@ -759,17 +814,18 @@ function renderReveal(m, isHost) {
 }
 
 function scoreList(m, gained = {}) {
-  const sorted = [...ST.players].sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+  const score = (p) => Number(p.score) || 0;
+  const sorted = [...ST.players].sort((a, b) => score(b) - score(a) || String(a.name).localeCompare(String(b.name)));
   return sorted.map((p) => {
-    const rank = 1 + sorted.filter((o) => o.score > p.score).length;
-    const g = gained[p.id];
+    const rank = 1 + sorted.filter((o) => score(o) > score(p)).length;
+    const g = Number(gained[p.id]) || 0;
     return `
       <li class="${p.id === m.id ? 'me' : ''}">
         <span class="rank">${rank}</span>
         ${avatar(p)}
         <span class="name">${esc(p.name)}</span>
         ${g ? `<span class="delta">+${g}</span>` : ''}
-        <span class="total">${p.score}</span>
+        <span class="total">${score(p)}</span>
       </li>`;
   }).join('');
 }
@@ -851,7 +907,9 @@ function uiTick() {
   } else if (ST.phase === 'reveal') {
     const secs = Math.max(0, Math.ceil((ST.revealEnds - (Date.now() + skew)) / 1000));
     const last = ST.round >= ST.total;
-    $('#r-next').textContent = `${last ? 'Final results' : 'Next round'} in ${secs}s`;
+    const text = `${last ? 'Final results' : 'Next round'} in ${secs}s`;
+    const el = $('#r-next');
+    if (el.textContent !== text) el.textContent = text;
   }
 }
 
@@ -1012,15 +1070,25 @@ function wire() {
     else setPreview('');
   });
 
+  // Phone number pads have no letters, so these add the word for you.
+  for (const b of $$('.mult button')) {
+    b.addEventListener('click', () => {
+      const input = $('#guess');
+      const base = input.value.replace(/\s*(k|thousand|mil|mn|million|b|bn|billion|trillion)\s*$/i, '').trim() || '1';
+      input.value = `${base} ${b.dataset.word}`;
+      input.dispatchEvent(new Event('input'));
+    });
+  }
+
   $('#guess-form').addEventListener('submit', (e) => {
     e.preventDefault();
     if (!ST || ST.phase !== 'question') return;
     const v = parseGuess($('#guess').value);
     if (v === null) { setPreview('Type a number first.', true); return; }
-    if (Number.isNaN(v)) { setPreview("That doesn't look like a number. Try 1500 or 1.3 million.", true); return; }
+    if (Number.isNaN(v)) { setPreview("That doesn't look like a number. Try 1500, or 1.3 then tap million.", true); return; }
     if (Math.abs(v) > 1e15) { setPreview("That's too big. Try a smaller number.", true); return; }
     if (remainingMs() <= 0) return;
-    myGuess = { round: ST.round, value: v };
+    myGuess = { round: ST.round, dl: ST.deadline, value: v };
     session.set('guess', { code: ST.code, ...myGuess });
     $('#guess').blur();
     send('guess', { round: ST.round, value: v });
